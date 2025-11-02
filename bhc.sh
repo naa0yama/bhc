@@ -27,6 +27,27 @@ DEVICE=""
 DEVICE_PATH=""
 SMART_BEFORE=""
 SMART_AFTER=""
+AUTO_CONFIRM=0  # Non-interactive mode flag
+
+#######################################
+# Show usage
+#######################################
+show_usage() {
+	cat << EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -d DEVICE    Device name to test (e.g., sda, sdb)
+  -y           Auto-confirm (skip all confirmation prompts)
+  -h           Show this help message
+
+Examples:
+  $0                    # Interactive mode
+  $0 -d sdg -y          # Non-interactive mode with device sdg
+
+EOF
+	exit 0
+}
 
 #######################################
 # Banner display
@@ -144,20 +165,27 @@ check_commands() {
 # Device selection
 #######################################
 select_device() {
-	echo ""
-	echo -e "${CYAN}=== Available Block Devices ===${NC}"
-	echo ""
+	# If device is already specified via command-line argument
+	if [[ -n "${DEVICE}" ]]; then
+		DEVICE_PATH="/dev/${DEVICE}"
+		log_info "Using device from command-line: ${DEVICE_PATH}"
+	else
+		# Interactive mode
+		echo ""
+		echo -e "${CYAN}=== Available Block Devices ===${NC}"
+		echo ""
 
-	lsblk -o NAME,HCTL,MODEL,SERIAL | grep -E '^[a-y]' || {
-		echo -e "${RED}Error: No block devices found${NC}"
-		exit 1
-	}
+		lsblk -o NAME,HCTL,MODEL,SERIAL | grep -E '^[a-y]' || {
+			echo -e "${RED}Error: No block devices found${NC}"
+			exit 1
+		}
 
-	echo ""
-	echo -ne "${YELLOW}Enter device name to test (e.g., sda): ${NC}"
-	read -r DEVICE
+		echo ""
+		echo -ne "${YELLOW}Enter device name to test (e.g., sda): ${NC}"
+		read -r DEVICE
 
-	DEVICE_PATH="/dev/${DEVICE}"
+		DEVICE_PATH="/dev/${DEVICE}"
+	fi
 
 	if [[ ! -b "${DEVICE_PATH}" ]]; then
 		echo -e "${RED}Error: ${DEVICE_PATH} is not a block device${NC}"
@@ -208,10 +236,11 @@ initialize_log() {
 
 	log_info "=================================="
 	log_info "Block Device Health Check Started"
-	log_info "Device: ${DEVICE_PATH}"
-	log_info "Type: ${device_type}"
-	log_info "Model: ${model}"
-	log_info "Serial: ${serial}"
+	log_info ""
+	log_info "Device:       ${DEVICE_PATH}"
+	log_info "Type:         ${device_type}"
+	log_info "Model:        ${model}"
+	log_info "Serial:       ${serial}"
 	log_info "=================================="
 
 	# Output all SMART information at the beginning
@@ -335,17 +364,22 @@ confirm_execution() {
 	echo -e "${RED}║ - SMART long test (several hours)                             ║${NC}"
 	echo -e "${RED}╚═══════════════════════════════════════════════════════════════╝${NC}"
 	echo ""
-	echo -ne "${YELLOW}Continue? (y/n): ${NC}"
 
-	read -r response
+	if [[ ${AUTO_CONFIRM} -eq 1 ]]; then
+		echo -e "${YELLOW}Auto-confirm enabled. Starting test automatically...${NC}"
+		log_info "Test execution auto-confirmed"
+	else
+		echo -ne "${YELLOW}Continue? (y/n): ${NC}"
+		read -r response
 
-	if [[ ! "${response}" =~ ^[Yy]$ ]]; then
-		log_info "Test cancelled by user"
-		echo "Test cancelled"
-		exit 0
+		if [[ ! "${response}" =~ ^[Yy]$ ]]; then
+			log_info "Test cancelled by user"
+			echo "Test cancelled"
+			exit 0
+		fi
+
+		log_info "User confirmed test execution"
 	fi
-
-	log_info "User confirmed test execution"
 }
 
 #######################################
@@ -412,8 +446,8 @@ get_sector_size() {
 	physical_sector=$(blockdev --getpbsz "${DEVICE_PATH}" 2>/dev/null || echo "512")
 	logical_sector=$(blockdev --getss "${DEVICE_PATH}" 2>/dev/null || echo "512")
 
-	log_info "Physical sector size: ${physical_sector} bytes"
-	log_info "Logical sector size: ${logical_sector} bytes"
+	log_info "Physical sector size: ${physical_sector} bytes" >&2
+	log_info "Logical sector size: ${logical_sector} bytes" >&2
 
 	echo "${physical_sector}"
 }
@@ -622,9 +656,39 @@ show_summary() {
 }
 
 #######################################
+# Parse command-line arguments
+#######################################
+parse_arguments() {
+	while getopts "d:yh" opt; do
+		case ${opt} in
+			d)
+				DEVICE="${OPTARG}"
+				;;
+			y)
+				AUTO_CONFIRM=1
+				;;
+			h)
+				show_usage
+				;;
+			\?)
+				echo -e "${RED}Invalid option: -${OPTARG}${NC}" >&2
+				show_usage
+				;;
+			:)
+				echo -e "${RED}Option -${OPTARG} requires an argument${NC}" >&2
+				show_usage
+				;;
+		esac
+	done
+}
+
+#######################################
 # Main process
 #######################################
 main() {
+	# Parse command-line arguments first
+	parse_arguments "$@"
+
 	show_banner
 	check_root
 	check_tmux
