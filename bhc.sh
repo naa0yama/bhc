@@ -8,7 +8,7 @@
 # - SMART short/long test execution
 #
 
-set -euxo pipefail
+set -euo pipefail
 
 # Color definitions
 readonly RED='\033[0;31m'
@@ -492,9 +492,22 @@ run_badblocks() {
 #######################################
 run_smart_long_test() {
 	log_info "Starting SMART long test..."
+
+	log_info "Checking for existing tests..."
+	if smartctl -l selftest "${DEVICE_PATH}" 2>&1 | grep -q "Self-test execution status:.*in progress"; then
+		log_warn "Existing test in progress. Aborting it..."
+		smartctl -X "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1 || true
+		sleep 5
+	fi
+
 	log_command "smartctl -t long ${DEVICE_PATH}"
 
-	smartctl -t long "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1
+	if ! smartctl -t long "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1; then
+		log_warn "Failed to start test normally. Retrying with force option..."
+		smartctl -X "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1 || true
+		sleep 5
+		smartctl -t long "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1
+	fi
 
 	# Get estimated completion time
 	local wait_minutes
@@ -536,11 +549,11 @@ run_smart_long_test() {
 		local test_result
 		test_result=$(smartctl -l selftest "${DEVICE_PATH}" 2>&1 || true)
 
-		if echo "${test_result}" | grep -q "# 1.*Extended.*Completed without error"; then
+		if echo "${test_result}" | grep "# 1" | grep -q "Extended.*Completed without error"; then
 			echo -e "\n${GREEN}SMART long test completed${NC}"
 			log_info "SMART long test completed (elapsed: $((elapsed / 60)) minutes)"
 			break
-		elif echo "${test_result}" | grep -q "# 1.*Extended.*Failed"; then
+		elif echo "${test_result}" | grep "# 1" | grep -q "Extended.*Failed"; then
 			echo -e "\n${RED}SMART long test failed${NC}"
 			log_error "SMART long test failed"
 			echo "${test_result}" >> "${LOG_FILE}"
