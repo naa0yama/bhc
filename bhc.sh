@@ -18,8 +18,9 @@ readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
 readonly NC='\033[0m' # No Color
 
-# Log directory
-readonly LOG_DIR="/var/log/bhc"
+# Log directory base
+readonly LOG_BASE="/var/log/bhc"
+LOG_DIR=""      # Will be set to specific test directory
 LOG_FILE=""
 
 # Global variables
@@ -28,6 +29,8 @@ DEVICE_PATH=""
 SMART_BEFORE=""
 SMART_AFTER=""
 AUTO_CONFIRM=0  # Non-interactive mode flag
+STATE_START_TIME=""  # Test start time for state management
+TEST_COUNT_BEFORE=0  # SMART self-test count before test
 
 #######################################
 # Show usage
@@ -133,6 +136,7 @@ check_commands() {
 		"badblocks:e2fsprogs"
 		"lsblk:util-linux"
 		"blockdev:util-linux"
+		"jq:jq"
 	)
 
 	local missing_packages=()
@@ -157,6 +161,17 @@ check_commands() {
 		mapfile -t unique_packages < <(printf '%s\n' "${missing_packages[@]}" | sort -u)
 
 		echo -e "${GREEN}sudo apt install -y ${unique_packages[*]}${NC}"
+		exit 1
+	fi
+
+	# Check if smartctl supports JSON output (-j option)
+	if ! smartctl --help 2>&1 | grep -q -- '-j'; then
+		echo -e "${RED}Error: smartctl does not support -j (JSON output) option${NC}"
+		echo "Please upgrade smartmontools to version 7.0 or later"
+		echo ""
+		echo "To upgrade on Debian 13, run:"
+		echo -e "${GREEN}sudo apt update${NC}"
+		echo -e "${GREEN}sudo apt install --only-upgrade smartmontools${NC}"
 		exit 1
 	fi
 }
@@ -201,7 +216,7 @@ select_device() {
 }
 
 #######################################
-# Initialize log file and output all SMART data
+# Initialize log directory and output all SMART data
 #######################################
 initialize_log() {
 	local device_type
@@ -227,12 +242,15 @@ initialize_log() {
 	serial=$(smartctl -i "${DEVICE_PATH}" | grep "Serial Number:" | awk '{print $3}' | tr -d ' ' || echo "UNKNOWN")
 
 	timestamp=$(date '+%Y%m%dT%H%M%S')
+	STATE_START_TIME="${timestamp}"
 
-	# Create log directory
+	# Create log directory structure
+	mkdir -p "${LOG_BASE}"
+	LOG_DIR="${LOG_BASE}/${device_type}_${model}_${serial}_${timestamp}"
 	mkdir -p "${LOG_DIR}"
 
-	# Log file name
-	LOG_FILE="${LOG_DIR}/${device_type}_${model}_${serial}_${timestamp}.log"
+	# Set log file path
+	LOG_FILE="${LOG_DIR}/console.log"
 
 	log_info "=================================="
 	log_info "Block Device Health Check Started"
@@ -241,9 +259,21 @@ initialize_log() {
 	log_info "Type:         ${device_type}"
 	log_info "Model:        ${model}"
 	log_info "Serial:       ${serial}"
+	log_info "Log Dir:      ${LOG_DIR}"
 	log_info "=================================="
 
-	# Output all SMART information at the beginning
+	# Save initial SMART data as JSON
+	log_info "Saving initial SMART data (JSON)..."
+	if ! smartctl -j -a "${DEVICE_PATH}" > "${LOG_DIR}/smartctl_start.json" 2>> "${LOG_FILE}"; then
+		log_error "Failed to save initial SMART data"
+		exit 1
+	fi
+
+	# Get initial test count
+	TEST_COUNT_BEFORE=$(jq '.ata_smart_self_test_log.standard.count // 0' "${LOG_DIR}/smartctl_start.json")
+	log_info "Initial self-test count: ${TEST_COUNT_BEFORE}"
+
+	# Output all SMART information at the beginning (text format for reference)
 	log_info "Outputting complete SMART information..."
 	{
 		echo ""
@@ -263,6 +293,137 @@ initialize_log() {
 		smartctl -l error "${DEVICE_PATH}" 2>&1
 		echo ""
 	} >> "${LOG_FILE}"
+
+	# Initialize state file
+	update_state "init"
+}
+
+#######################################
+# Update state file
+#######################################
+update_state() {
+	local new_phase=$1
+	local timestamp
+	timestamp=$(date -Iseconds)
+
+	if [[ -z "${LOG_DIR}" ]] || [[ ! -d "${LOG_DIR}" ]]; then
+		log_error "LOG_DIR is not set or does not exist"
+		return 1
+	fi
+
+	jq -n \
+		--arg device "${DEVICE_PATH}" \
+		--arg phase "${new_phase}" \
+		--arg start "${STATE_START_TIME}" \
+		--arg update "${timestamp}" \
+		'{device: $device, phase: $phase, start_time: $start, last_update: $update}' \
+		> "${LOG_DIR}/state.json"
+
+	log_info "State updated: ${new_phase}"
+}
+
+#######################################
+# Check for existing state and ask to resume
+#######################################
+check_resume() {
+	# Look for existing incomplete test runs
+	local existing_dirs
+	mapfile -t existing_dirs < <(find "${LOG_BASE}" -maxdepth 1 -type d -name "*_*_*_*" 2>/dev/null | sort -r)
+
+	if [[ ${#existing_dirs[@]} -eq 0 ]]; then
+		return 0
+	fi
+
+	# Check each directory for incomplete state
+	for dir in "${existing_dirs[@]}"; do
+		local state_file="${dir}/state.json"
+		if [[ ! -f "${state_file}" ]]; then
+			continue
+		fi
+
+		local phase
+		local device
+		phase=$(jq -r '.phase' "${state_file}" 2>/dev/null)
+		device=$(jq -r '.device' "${state_file}" 2>/dev/null)
+
+		# Skip if completed or if device doesn't match
+		if [[ "${phase}" == "completed" ]] || [[ "${device}" != "${DEVICE_PATH}" ]]; then
+			continue
+		fi
+
+		# Found incomplete test for this device
+		echo ""
+		echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
+		echo -e "${YELLOW}║          Incomplete Test Found                                ║${NC}"
+		echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+		echo ""
+		echo -e "${CYAN}Device:${NC}        ${device}"
+		echo -e "${CYAN}Log Directory:${NC} ${dir}"
+		echo -e "${CYAN}Last Phase:${NC}    ${phase}"
+		echo -e "${CYAN}State File:${NC}    ${state_file}"
+		echo ""
+
+		if [[ ${AUTO_CONFIRM} -eq 1 ]]; then
+			echo -e "${YELLOW}Auto-confirm enabled. Starting fresh test...${NC}"
+			log_info "Found incomplete test but auto-confirm is enabled, starting fresh"
+			return 0
+		fi
+
+		echo -ne "${YELLOW}Do you want to resume this test? (y/n): ${NC}"
+		read -r response
+
+		if [[ "${response}" =~ ^[Yy]$ ]]; then
+			# Resume from existing state
+			LOG_DIR="${dir}"
+			LOG_FILE="${LOG_DIR}/console.log"
+
+			log_info "Resuming test from phase: ${phase}"
+
+			# Load necessary state
+			STATE_START_TIME=$(jq -r '.start_time' "${state_file}")
+			if [[ -f "${LOG_DIR}/smartctl_start.json" ]]; then
+				TEST_COUNT_BEFORE=$(jq '.ata_smart_self_test_log.standard.count // 0' "${LOG_DIR}/smartctl_start.json")
+			fi
+
+			# Resume based on phase
+			case "${phase}" in
+				"init"|"smart_short_test")
+					log_info "Resuming from SMART short test..."
+					run_smart_short_test
+					run_badblocks
+					run_smart_long_test
+					compare_smart_values
+					show_summary
+					exit 0
+					;;
+				"badblocks")
+					log_info "Resuming from badblocks test..."
+					run_badblocks
+					run_smart_long_test
+					compare_smart_values
+					show_summary
+					exit 0
+					;;
+				"smart_long_test")
+					log_info "Resuming from SMART long test..."
+					run_smart_long_test
+					compare_smart_values
+					show_summary
+					exit 0
+					;;
+				"compare")
+					log_info "Resuming from comparison..."
+					compare_smart_values
+					show_summary
+					exit 0
+					;;
+			esac
+		else
+			echo "Starting fresh test..."
+			log_info "User chose to start fresh test instead of resuming"
+			return 0
+		fi
+	done
 }
 
 #######################################
@@ -387,46 +548,101 @@ confirm_execution() {
 #######################################
 run_smart_short_test() {
 	log_info "Starting SMART short test..."
+	update_state "smart_short_test"
+
 	log_command "smartctl -t short ${DEVICE_PATH}"
 
-	smartctl -t short "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1
+	if ! smartctl -t short "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1; then
+		log_warn "Failed to start test normally. Retrying..."
+		smartctl -X "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1 || true
+		sleep 5
+		smartctl -t short "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1
+	fi
 
-	# Get estimated completion time
-	local wait_time
-	wait_time=$(smartctl -a "${DEVICE_PATH}" | grep "Please wait" | grep -oP '\d+' | head -1 || echo "2")
+	# Get estimated completion time from JSON
+	local wait_minutes
+	wait_minutes=$(smartctl -j -a "${DEVICE_PATH}" | jq '.ata_smart_data.self_test.polling_minutes.short // 2')
 
-	log_info "Estimated completion time: ${wait_time} minutes"
-	echo -ne "${CYAN}Test running"
+	log_info "Estimated completion time: ${wait_minutes} minutes"
+
+	local total_seconds=$((wait_minutes * 60))
+	local check_interval=10
+	local elapsed=0
+
+	echo -e "${CYAN}SMART short test running...${NC}"
 
 	# Wait until completion
-	local elapsed=0
 	while true; do
-		sleep 10
-		elapsed=$((elapsed + 10))
-		echo -n "."
+		sleep "${check_interval}"
+		elapsed=$((elapsed + check_interval))
 
-		# Check test result
-		local test_result
-		test_result=$(smartctl -l selftest "${DEVICE_PATH}" 2>&1 || true)
+		# Get current SMART data as JSON
+		smartctl -j -a "${DEVICE_PATH}" > "${LOG_DIR}/smartctl_current.json" 2>> "${LOG_FILE}"
 
-		if echo "${test_result}" | grep -q "# 1.*Short.*Completed without error"; then
-			echo -e " ${GREEN}Completed${NC}"
-			log_info "SMART short test completed (elapsed: ${elapsed}s)"
-			break
-		elif echo "${test_result}" | grep -q "# 1.*Short.*Failed"; then
-			echo -e " ${RED}Failed${NC}"
-			log_error "SMART short test failed"
-			echo "${test_result}" >> "${LOG_FILE}"
+		local status_value
+		local remaining
+		local test_count_now
+		status_value=$(jq '.ata_smart_data.self_test.status.value' "${LOG_DIR}/smartctl_current.json")
+		remaining=$(jq '.ata_smart_data.self_test.status.remaining_percent // 0' "${LOG_DIR}/smartctl_current.json")
+		test_count_now=$(jq '.ata_smart_self_test_log.standard.count // 0' "${LOG_DIR}/smartctl_current.json")
+
+		# Display progress
+		if [[ ${remaining} -gt 0 ]] && [[ ${status_value} -ge 240 ]] && [[ ${status_value} -le 255 ]]; then
+			# Test in progress
+			local progress=$((100 - remaining))
+			printf "\rProgress: %3d%% | Elapsed: %d sec | Remaining: ~%d%%" \
+				"${progress}" "${elapsed}" "${remaining}"
+		else
+			local progress_pct=$((elapsed * 100 / total_seconds))
+			if [[ ${progress_pct} -gt 100 ]]; then
+				progress_pct=100
+			fi
+			printf "\rProgress: %3d%% | Elapsed: %d sec" "${progress_pct}" "${elapsed}"
+		fi
+
+		# Check test completion using composite judgment
+		if [[ ${status_value} -eq 0 ]]; then
+			# Idle state - check if test actually completed
+			if [[ ${test_count_now} -gt ${TEST_COUNT_BEFORE} ]]; then
+				# New test result added - verify it's a short test
+				local latest_type
+				local latest_passed
+				latest_type=$(jq '.ata_smart_self_test_log.standard.table[0].type.value' "${LOG_DIR}/smartctl_current.json")
+				latest_passed=$(jq '.ata_smart_self_test_log.standard.table[0].status.passed' "${LOG_DIR}/smartctl_current.json")
+
+				if [[ ${latest_type} -eq 1 ]] && [[ "${latest_passed}" == "true" ]]; then
+					echo -e "\n${GREEN}SMART short test completed${NC}"
+					log_info "SMART short test completed (elapsed: ${elapsed}s)"
+					break
+				elif [[ ${latest_type} -eq 1 ]]; then
+					echo -e "\n${RED}SMART short test failed${NC}"
+					log_error "SMART short test failed"
+					jq '.ata_smart_self_test_log.standard.table[0]' "${LOG_DIR}/smartctl_current.json" >> "${LOG_FILE}"
+					exit 1
+				fi
+			fi
+		elif [[ ${status_value} -ge 1 ]] && [[ ${status_value} -le 8 ]]; then
+			# Test failed
+			echo -e "\n${RED}SMART short test failed (status: ${status_value})${NC}"
+			log_error "SMART short test failed with status value: ${status_value}"
 			exit 1
 		fi
 
-		# Timeout (10 minutes)
-		if [[ ${elapsed} -gt 600 ]]; then
-			echo -e " ${RED}Timeout${NC}"
+		# Timeout (10 minutes or 2x estimated time, whichever is longer)
+		local max_wait=$((total_seconds * 2))
+		if [[ ${max_wait} -lt 600 ]]; then
+			max_wait=600
+		fi
+
+		if [[ ${elapsed} -gt ${max_wait} ]]; then
+			echo -e "\n${RED}Timeout${NC}"
 			log_error "SMART short test timeout"
 			exit 1
 		fi
 	done
+
+	# Update test count
+	TEST_COUNT_BEFORE=${test_count_now}
 
 	# Log test result
 	{
@@ -457,6 +673,7 @@ get_sector_size() {
 #######################################
 run_badblocks() {
 	log_info "Starting badblocks full sector write test..."
+	update_state "badblocks"
 
 	local sector_size
 	sector_size=$(get_sector_size)
@@ -492,6 +709,7 @@ run_badblocks() {
 #######################################
 run_smart_long_test() {
 	log_info "Starting SMART long test..."
+	update_state "smart_long_test"
 
 	log_info "Checking for existing tests..."
 	if smartctl -l selftest "${DEVICE_PATH}" 2>&1 | grep -q "Self-test execution status:.*in progress"; then
@@ -509,11 +727,11 @@ run_smart_long_test() {
 		smartctl -t long "${DEVICE_PATH}" >> "${LOG_FILE}" 2>&1
 	fi
 
-	# Get estimated completion time
+	# Get estimated completion time from JSON
 	local wait_minutes
-	wait_minutes=$(smartctl -a "${DEVICE_PATH}" | grep "Please wait" | grep -oP '\d+' | tail -1 || echo "120")
+	wait_minutes=$(smartctl -j -a "${DEVICE_PATH}" | jq '.ata_smart_data.self_test.polling_minutes.extended // 120')
 
-	log_info "Estimated completion time: ${wait_minutes} minutes"
+	log_info "Estimated completion time: ${wait_minutes} minutes ($(printf "%.1f" "$(echo "${wait_minutes} / 60" | bc -l)") hours)"
 
 	local total_seconds=$((wait_minutes * 60))
 	local check_interval=60  # Check every 1 minute
@@ -525,48 +743,84 @@ run_smart_long_test() {
 		sleep "${check_interval}"
 		elapsed=$((elapsed + check_interval))
 
+		# Get current SMART data as JSON
+		smartctl -j -a "${DEVICE_PATH}" > "${LOG_DIR}/smartctl_current.json" 2>> "${LOG_FILE}"
+
+		local status_value
+		local remaining
+		local test_count_now
+		status_value=$(jq '.ata_smart_data.self_test.status.value' "${LOG_DIR}/smartctl_current.json")
+		remaining=$(jq '.ata_smart_data.self_test.status.remaining_percent // 0' "${LOG_DIR}/smartctl_current.json")
+		test_count_now=$(jq '.ata_smart_self_test_log.standard.count // 0' "${LOG_DIR}/smartctl_current.json")
+
 		# Display progress
-		local progress_pct=$((elapsed * 100 / total_seconds))
-		if [[ ${progress_pct} -gt 100 ]]; then
-			progress_pct=100
+		if [[ ${remaining} -gt 0 ]] && [[ ${status_value} -ge 240 ]] && [[ ${status_value} -le 255 ]]; then
+			# Test in progress - use remaining_percent for accurate progress
+			local progress=$((100 - remaining))
+			local elapsed_min=$((elapsed / 60))
+			local eta_min=$((wait_minutes * remaining / 100))
+			local eta_hours=$((eta_min / 60))
+			local eta_min_rem=$((eta_min % 60))
+
+			printf "\rProgress: %3d%% | Elapsed: %d min | Remaining: ~%d%% (~%dh%02dm)" \
+				"${progress}" "${elapsed_min}" "${remaining}" "${eta_hours}" "${eta_min_rem}"
+		else
+			# Use estimated time for progress
+			local progress_pct=$((elapsed * 100 / total_seconds))
+			if [[ ${progress_pct} -gt 100 ]]; then
+				progress_pct=100
+			fi
+
+			local remaining_sec=$((total_seconds - elapsed))
+			if [[ ${remaining_sec} -lt 0 ]]; then
+				remaining_sec=0
+			fi
+
+			local eta_hours=$((remaining_sec / 3600))
+			local eta_minutes=$(((remaining_sec % 3600) / 60))
+
+			printf "\rProgress: %3d%% | Elapsed: %d min | ETA: %dh%02dm" \
+				"${progress_pct}" "$((elapsed / 60))" "${eta_hours}" "${eta_minutes}"
 		fi
 
-		local remaining=$((total_seconds - elapsed))
-		if [[ ${remaining} -lt 0 ]]; then
-			remaining=0
-		fi
+		# Check test completion using composite judgment
+		if [[ ${status_value} -eq 0 ]]; then
+			# Idle state - check if test actually completed
+			if [[ ${test_count_now} -gt ${TEST_COUNT_BEFORE} ]]; then
+				# New test result added - verify it's an extended test
+				local latest_type
+				local latest_passed
+				latest_type=$(jq '.ata_smart_self_test_log.standard.table[0].type.value' "${LOG_DIR}/smartctl_current.json")
+				latest_passed=$(jq '.ata_smart_self_test_log.standard.table[0].status.passed' "${LOG_DIR}/smartctl_current.json")
 
-		local eta_hours=$((remaining / 3600))
-		local eta_minutes=$(((remaining % 3600) / 60))
-
-		printf "\rProgress: %3d%% | Elapsed: %d min | ETA: %dh%02dm" \
-			"${progress_pct}" \
-			"$((elapsed / 60))" \
-			"${eta_hours}" \
-			"${eta_minutes}"
-
-		# Check test result
-		local test_result
-		test_result=$(smartctl -l selftest "${DEVICE_PATH}" 2>&1 || true)
-
-		if echo "${test_result}" | grep "# 1" | grep -q "Extended.*Completed without error"; then
-			echo -e "\n${GREEN}SMART long test completed${NC}"
-			log_info "SMART long test completed (elapsed: $((elapsed / 60)) minutes)"
-			break
-		elif echo "${test_result}" | grep "# 1" | grep -q "Extended.*Failed"; then
-			echo -e "\n${RED}SMART long test failed${NC}"
-			log_error "SMART long test failed"
-			echo "${test_result}" >> "${LOG_FILE}"
+				if [[ ${latest_type} -eq 2 ]] && [[ "${latest_passed}" == "true" ]]; then
+					echo -e "\n${GREEN}SMART long test completed${NC}"
+					log_info "SMART long test completed (elapsed: $((elapsed / 60)) minutes)"
+					break
+				elif [[ ${latest_type} -eq 2 ]]; then
+					echo -e "\n${RED}SMART long test failed${NC}"
+					log_error "SMART long test failed"
+					jq '.ata_smart_self_test_log.standard.table[0]' "${LOG_DIR}/smartctl_current.json" >> "${LOG_FILE}"
+					exit 1
+				fi
+			fi
+		elif [[ ${status_value} -ge 1 ]] && [[ ${status_value} -le 8 ]]; then
+			# Test failed
+			echo -e "\n${RED}SMART long test failed (status: ${status_value})${NC}"
+			log_error "SMART long test failed with status value: ${status_value}"
 			exit 1
 		fi
 
 		# Timeout if exceeds 2x estimated time
 		if [[ ${elapsed} -gt $((total_seconds * 2)) ]]; then
 			echo -e "\n${RED}Timeout${NC}"
-			log_error "SMART long test timeout"
+			log_error "SMART long test timeout (exceeded $((total_seconds * 2 / 60)) minutes)"
 			exit 1
 		fi
 	done
+
+	# Update test count
+	TEST_COUNT_BEFORE=${test_count_now}
 
 	# Log test result
 	{
@@ -581,8 +835,16 @@ run_smart_long_test() {
 #######################################
 compare_smart_values() {
 	log_info "Comparing SMART values..."
+	update_state "compare"
 
-	# Get SMART information after test
+	# Save final SMART data as JSON
+	log_info "Saving final SMART data (JSON)..."
+	if ! smartctl -j -a "${DEVICE_PATH}" > "${LOG_DIR}/smartctl_end.json" 2>> "${LOG_FILE}"; then
+		log_error "Failed to save final SMART data"
+		exit 1
+	fi
+
+	# Get SMART information after test (text format for reference)
 	{
 		echo "=== SMART Information (After Test) ==="
 		smartctl -x "${DEVICE_PATH}"
@@ -591,7 +853,7 @@ compare_smart_values() {
 
 	SMART_AFTER=$(smartctl -A "${DEVICE_PATH}" 2>&1)
 
-	# Compare critical attributes
+	# Compare critical attributes using JSON
 	local critical_attrs=(
 		"1:Raw_Read_Error_Rate"
 		"5:Reallocated_Sector_Ct"
@@ -601,7 +863,7 @@ compare_smart_values() {
 		"198:Offline_Uncorrectable"
 	)
 
-	log_info "Comparing critical indicators:"
+	log_info "Comparing critical indicators (JSON-based):"
 	echo "" | tee -a "${LOG_FILE}"
 	printf "%-30s | %-10s | %-10s | %s\n" "Attribute" "Before" "After" "Status" | tee -a "${LOG_FILE}"
 	printf "%s\n" "--------------------------------------------------------------------------------" | tee -a "${LOG_FILE}"
@@ -615,11 +877,18 @@ compare_smart_values() {
 		local value_before
 		local value_after
 
-		value_before=$(echo "${SMART_BEFORE}" | grep "^${id} " | awk '{print $10}' || echo "N/A")
-		value_after=$(echo "${SMART_AFTER}" | grep "^${id} " | awk '{print $10}' || echo "N/A")
+		# Extract values from JSON using jq
+		value_before=$(jq ".ata_smart_attributes.table[] | select(.id == ${id}) | .raw.value" "${LOG_DIR}/smartctl_start.json" 2>/dev/null || echo "null")
+		value_after=$(jq ".ata_smart_attributes.table[] | select(.id == ${id}) | .raw.value" "${LOG_DIR}/smartctl_end.json" 2>/dev/null || echo "null")
 
-		if [[ "${value_before}" == "N/A" ]] || [[ "${value_after}" == "N/A" ]]; then
-			continue
+		if [[ "${value_before}" == "null" ]] || [[ "${value_after}" == "null" ]]; then
+			# Attribute not found in JSON, try text format as fallback
+			value_before=$(echo "${SMART_BEFORE}" | grep "^${id} " | awk '{print $10}' || echo "N/A")
+			value_after=$(echo "${SMART_AFTER}" | grep "^${id} " | awk '{print $10}' || echo "N/A")
+
+			if [[ "${value_before}" == "N/A" ]] || [[ "${value_after}" == "N/A" ]]; then
+				continue
+			fi
 		fi
 
 		local status="OK"
@@ -643,6 +912,9 @@ compare_smart_values() {
 	else
 		log_info "No changes detected in critical indicators"
 	fi
+
+	# Mark as completed
+	update_state "completed"
 }
 
 #######################################
@@ -707,6 +979,10 @@ main() {
 	check_tmux
 	check_commands
 	select_device
+
+	# Check for existing incomplete tests and offer to resume
+	check_resume
+
 	initialize_log
 	check_seagate_firmware
 	check_smart_initial
